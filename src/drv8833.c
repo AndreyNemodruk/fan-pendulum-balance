@@ -11,191 +11,95 @@
 
 static const char *TAG = "drv8833";
 
-#define DRV8833_SPEED_MODE LEDC_LOW_SPEED_MODE
-#define DRV8833_TIMER      LEDC_TIMER_0
-#define DRV8833_DUTY_BITS  LEDC_TIMER_8_BIT
-#define DRV8833_DUTY_MAX   ((1u << 8) - 1u)
+#define SPEED_MODE LEDC_LOW_SPEED_MODE
+#define DUTY_BITS  8
+#define DUTY_MAX   ((1u << DUTY_BITS) - 1u) /* 255 = команда 100 %         */
+#define DUTY_HIGH  (1u << DUTY_BITS)        /* 256 = вихід постійно в 1    */
 
+/* Кожен мотор використовує два канали LEDC, по одному на вхід моста. */
 typedef struct {
     ledc_channel_t in1;
     ledc_channel_t in2;
-    int pin_in1;
-    int pin_in2;
-} drv8833_channel_t;
+} motor_channels_t;
 
-static const drv8833_channel_t s_motors[] = {
-    [DRV8833_MOTOR_A] = {
-        .in1 = LEDC_CHANNEL_0,
-        .in2 = LEDC_CHANNEL_1,
-        .pin_in1 = DRV8833_PIN_AIN1,
-        .pin_in2 = DRV8833_PIN_AIN2,
-    },
-    [DRV8833_MOTOR_B] = {
-        .in1 = LEDC_CHANNEL_2,
-        .in2 = LEDC_CHANNEL_3,
-        .pin_in1 = DRV8833_PIN_BIN1,
-        .pin_in2 = DRV8833_PIN_BIN2,
-    },
+static const motor_channels_t s_motors[2] = {
+    [DRV8833_MOTOR_A] = {LEDC_CHANNEL_0, LEDC_CHANNEL_1},
+    [DRV8833_MOTOR_B] = {LEDC_CHANNEL_2, LEDC_CHANNEL_3},
 };
 
-static bool s_ready;
-static uint32_t s_pwm_hz = DRV8833_PWM_HZ;
-
-static esp_err_t drv8833_set_duty(ledc_channel_t channel, uint32_t duty)
+/* Задати заповнення одного каналу й одразу його застосувати. */
+static esp_err_t set_duty(ledc_channel_t ch, uint32_t duty)
 {
-    ESP_RETURN_ON_ERROR(ledc_set_duty(DRV8833_SPEED_MODE, channel, duty), TAG, "set duty");
-    return ledc_update_duty(DRV8833_SPEED_MODE, channel);
+    ESP_RETURN_ON_ERROR(ledc_set_duty(SPEED_MODE, ch, duty), TAG, "set duty");
+    return ledc_update_duty(SPEED_MODE, ch);
 }
 
-static esp_err_t drv8833_config_channel(ledc_channel_t channel, int gpio_num)
+/* Прив'язати канал LEDC до GPIO, старт із заповненням 0 (вихід у 0). */
+static esp_err_t channel_init(ledc_channel_t ch, int gpio)
 {
     ledc_channel_config_t cfg = {
-        .gpio_num = gpio_num,
-        .speed_mode = DRV8833_SPEED_MODE,
-        .channel = channel,
-        .timer_sel = DRV8833_TIMER,
+        .gpio_num = gpio,
+        .speed_mode = SPEED_MODE,
+        .channel = ch,
+        .timer_sel = LEDC_TIMER_0,
         .duty = 0,
-        .hpoint = 0,
     };
     return ledc_channel_config(&cfg);
 }
 
-static esp_err_t drv8833_timer_init(void)
-{
-    const uint32_t candidates[] = {DRV8833_PWM_HZ, 10000, 5000, 1000};
-
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-        ledc_timer_config_t timer = {
-            .speed_mode = DRV8833_SPEED_MODE,
-            .duty_resolution = DRV8833_DUTY_BITS,
-            .timer_num = DRV8833_TIMER,
-            .freq_hz = candidates[i],
-            .clk_cfg = LEDC_AUTO_CLK,
-        };
-
-        if (ledc_timer_config(&timer) == ESP_OK) {
-            s_pwm_hz = candidates[i];
-            return ESP_OK;
-        }
-    }
-
-    return ESP_FAIL;
-}
-
-esp_err_t drv8833_set_sleep(bool sleep)
-{
-#if DRV8833_PIN_NSLEEP < 0
-    (void)sleep;
-    return ESP_OK;
-#else
-    return gpio_set_level(DRV8833_PIN_NSLEEP, sleep ? 0 : 1);
-#endif
-}
-
 esp_err_t drv8833_init(void)
 {
-    if (s_ready) {
-        return ESP_OK;
-    }
-
-    /*
-     * Keep the bridge asleep and force all inputs low before PWM starts.
-     * Otherwise floating AIN/BIN after reset can spin the motors briefly.
-     */
-    uint64_t in_mask = 0;
-    for (size_t i = 0; i < sizeof(s_motors) / sizeof(s_motors[0]); i++) {
-        in_mask |= 1ULL << s_motors[i].pin_in1;
-        in_mask |= 1ULL << s_motors[i].pin_in2;
-    }
-
-#if DRV8833_PIN_NSLEEP >= 0
-    gpio_config_t sleep_cfg = {
+    /* Тримаємо міст у сні, поки налаштовуються ШІМ-виводи. */
+    gpio_config_t sleep_pin = {
         .pin_bit_mask = 1ULL << DRV8833_PIN_NSLEEP,
         .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
     };
-    ESP_RETURN_ON_ERROR(gpio_config(&sleep_cfg), TAG, "nsleep gpio");
-    ESP_RETURN_ON_ERROR(drv8833_set_sleep(true), TAG, "hold sleep");
-#endif
+    ESP_RETURN_ON_ERROR(gpio_config(&sleep_pin), TAG, "nsleep");
+    gpio_set_level(DRV8833_PIN_NSLEEP, 0);
 
-    gpio_config_t in_cfg = {
-        .pin_bit_mask = in_mask,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+    ledc_timer_config_t timer = {
+        .speed_mode = SPEED_MODE,
+        .duty_resolution = DUTY_BITS,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = DRV8833_PWM_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
     };
-    ESP_RETURN_ON_ERROR(gpio_config(&in_cfg), TAG, "inputs gpio");
-    for (size_t i = 0; i < sizeof(s_motors) / sizeof(s_motors[0]); i++) {
-        gpio_set_level(s_motors[i].pin_in1, 0);
-        gpio_set_level(s_motors[i].pin_in2, 0);
-    }
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "timer");
 
-    ESP_RETURN_ON_ERROR(drv8833_timer_init(), TAG, "timer");
+    ESP_RETURN_ON_ERROR(channel_init(s_motors[DRV8833_MOTOR_A].in1, DRV8833_PIN_AIN1), TAG, "ain1");
+    ESP_RETURN_ON_ERROR(channel_init(s_motors[DRV8833_MOTOR_A].in2, DRV8833_PIN_AIN2), TAG, "ain2");
+    ESP_RETURN_ON_ERROR(channel_init(s_motors[DRV8833_MOTOR_B].in1, DRV8833_PIN_BIN1), TAG, "bin1");
+    ESP_RETURN_ON_ERROR(channel_init(s_motors[DRV8833_MOTOR_B].in2, DRV8833_PIN_BIN2), TAG, "bin2");
 
-    for (size_t i = 0; i < sizeof(s_motors) / sizeof(s_motors[0]); i++) {
-        ESP_RETURN_ON_ERROR(drv8833_config_channel(s_motors[i].in1, s_motors[i].pin_in1), TAG, "in1");
-        ESP_RETURN_ON_ERROR(drv8833_config_channel(s_motors[i].in2, s_motors[i].pin_in2), TAG, "in2");
-    }
-
-    s_ready = true;
-    ESP_RETURN_ON_ERROR(drv8833_stop_all(), TAG, "stop");
-
-#if DRV8833_PIN_NSLEEP >= 0
-    ESP_RETURN_ON_ERROR(drv8833_set_sleep(false), TAG, "wake");
+    /* Усі входи в 0 -> будимо міст. */
+    gpio_set_level(DRV8833_PIN_NSLEEP, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
-#endif
 
-    ESP_LOGI(TAG, "ready @ %lu Hz", (unsigned long)s_pwm_hz);
+    ESP_LOGI(TAG, "ready, PWM %d Hz", DRV8833_PWM_HZ);
     return ESP_OK;
 }
 
 esp_err_t drv8833_set_speed(drv8833_motor_t motor, int speed_pct)
 {
-    ESP_RETURN_ON_FALSE(s_ready, ESP_ERR_INVALID_STATE, TAG, "not init");
-    ESP_RETURN_ON_FALSE(motor == DRV8833_MOTOR_A || motor == DRV8833_MOTOR_B,
-                        ESP_ERR_INVALID_ARG, TAG, "motor");
-
     if (speed_pct > 100) {
         speed_pct = 100;
     } else if (speed_pct < -100) {
         speed_pct = -100;
     }
 
-    const drv8833_channel_t *ch = &s_motors[motor];
-    const uint32_t duty = (uint32_t)((abs(speed_pct) * (int)DRV8833_DUTY_MAX) / 100);
+    const motor_channels_t *m = &s_motors[motor];
+    const uint32_t duty = (uint32_t)abs(speed_pct) * DUTY_MAX / 100u;
 
-    /* Positive speed → IN1 PWM (prop direction; flip IN1/IN2 to invert spin). */
-    if (speed_pct > 0) {
-        ESP_RETURN_ON_ERROR(drv8833_set_duty(ch->in1, duty), TAG, "fwd in1");
-        ESP_RETURN_ON_ERROR(drv8833_set_duty(ch->in2, 0), TAG, "fwd in2");
-    } else if (speed_pct < 0) {
-        ESP_RETURN_ON_ERROR(drv8833_set_duty(ch->in1, 0), TAG, "rev in1");
-        ESP_RETURN_ON_ERROR(drv8833_set_duty(ch->in2, duty), TAG, "rev in2");
-    } else {
-        ESP_RETURN_ON_ERROR(drv8833_set_duty(ch->in1, 0), TAG, "stop in1");
-        ESP_RETURN_ON_ERROR(drv8833_set_duty(ch->in2, 0), TAG, "stop in2");
-    }
-
-    return ESP_OK;
-}
-
-esp_err_t drv8833_stop(drv8833_motor_t motor)
-{
-    return drv8833_set_speed(motor, 0);
+    /* Один вхід отримує ШІМ, інший у 0. Обидва в 0 = вільний вибіг. */
+    ESP_RETURN_ON_ERROR(set_duty(m->in1, speed_pct > 0 ? duty : 0), TAG, "in1");
+    return set_duty(m->in2, speed_pct < 0 ? duty : 0);
 }
 
 esp_err_t drv8833_brake(drv8833_motor_t motor)
 {
-    ESP_RETURN_ON_FALSE(s_ready, ESP_ERR_INVALID_STATE, TAG, "not init");
-    ESP_RETURN_ON_FALSE(motor == DRV8833_MOTOR_A || motor == DRV8833_MOTOR_B,
-                        ESP_ERR_INVALID_ARG, TAG, "motor");
-    const drv8833_channel_t *ch = &s_motors[motor];
-    const uint32_t full = 1u << 8; /* duty = 2^bits -> constant high */
-    ESP_RETURN_ON_ERROR(drv8833_set_duty(ch->in1, full), TAG, "brake in1");
-    return drv8833_set_duty(ch->in2, full);
+    const motor_channels_t *m = &s_motors[motor];
+    ESP_RETURN_ON_ERROR(set_duty(m->in1, DUTY_HIGH), TAG, "brake in1");
+    return set_duty(m->in2, DUTY_HIGH);
 }
 
 esp_err_t drv8833_stop_all(void)
