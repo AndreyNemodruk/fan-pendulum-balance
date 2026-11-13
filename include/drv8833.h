@@ -33,5 +33,7 @@ esp_err_t drv8833_init(void);
 esp_err_t drv8833_set_speed(drv8833_motor_t motor, int speed_pct);
 
 esp_err_t drv8833_stop(drv8833_motor_t motor);
+/* Short brake: IN1 = IN2 = high, motor terminals shorted -> fast stop. */
+esp_err_t drv8833_brake(drv8833_motor_t motor);
 esp_err_t drv8833_stop_all(void);
 esp_err_t drv8833_set_sleep(bool sleep);

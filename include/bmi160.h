@@ -14,10 +14,6 @@ typedef struct bmi160_dev bmi160_t;
 typedef struct {
     float acc_g[3];
     float gyr_dps[3];
-    float tilt_deg;
-    float pitch_deg;
-    float roll_deg;
-    float temp_c;
 } bmi160_sample_t;
 
 esp_err_t bmi160_init(bmi160_t **dev);

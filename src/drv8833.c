@@ -167,6 +167,7 @@ esp_err_t drv8833_set_speed(drv8833_motor_t motor, int speed_pct)
     const drv8833_channel_t *ch = &s_motors[motor];
     const uint32_t duty = (uint32_t)((abs(speed_pct) * (int)DRV8833_DUTY_MAX) / 100);
 
+    /* Positive speed → IN1 PWM (prop direction; flip IN1/IN2 to invert spin). */
     if (speed_pct > 0) {
         ESP_RETURN_ON_ERROR(drv8833_set_duty(ch->in1, duty), TAG, "fwd in1");
         ESP_RETURN_ON_ERROR(drv8833_set_duty(ch->in2, 0), TAG, "fwd in2");
@@ -184,6 +185,17 @@ esp_err_t drv8833_set_speed(drv8833_motor_t motor, int speed_pct)
 esp_err_t drv8833_stop(drv8833_motor_t motor)
 {
     return drv8833_set_speed(motor, 0);
+}
+
+esp_err_t drv8833_brake(drv8833_motor_t motor)
+{
+    ESP_RETURN_ON_FALSE(s_ready, ESP_ERR_INVALID_STATE, TAG, "not init");
+    ESP_RETURN_ON_FALSE(motor == DRV8833_MOTOR_A || motor == DRV8833_MOTOR_B,
+                        ESP_ERR_INVALID_ARG, TAG, "motor");
+    const drv8833_channel_t *ch = &s_motors[motor];
+    const uint32_t full = 1u << 8; /* duty = 2^bits -> constant high */
+    ESP_RETURN_ON_ERROR(drv8833_set_duty(ch->in1, full), TAG, "brake in1");
+    return drv8833_set_duty(ch->in2, full);
 }
 
 esp_err_t drv8833_stop_all(void)

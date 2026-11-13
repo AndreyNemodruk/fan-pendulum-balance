@@ -1,13 +1,12 @@
 #include "bmi160.h"
 
-#include <math.h>
 #include <stdbool.h>
 #include <string.h>
 
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
-#include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -19,7 +18,6 @@ static const char *TAG = "bmi160";
 #define BMI160_REG_ERR       0x02
 #define BMI160_REG_PMU       0x03
 #define BMI160_REG_DATA      0x0C
-#define BMI160_REG_TEMP      0x20
 #define BMI160_REG_ACC_CONF  0x40
 #define BMI160_REG_ACC_RANGE 0x41
 #define BMI160_REG_GYR_CONF  0x42
@@ -33,27 +31,23 @@ static const char *TAG = "bmi160";
 #define BMI160_CMD_GYR_NORMAL 0x15
 #define BMI160_CMD_SOFT_RESET 0xB6
 
-/* odr = 100 Hz (0x08), bwp = normal (0x02) */
-#define BMI160_CONF_100HZ_NORMAL 0x28
-#define BMI160_ACC_RANGE_2G      0x03
+/* odr = 400 Hz (0x0A), bwp = normal (0x02): less filter delay than 100 Hz */
+#define BMI160_CONF_100HZ_NORMAL 0x2A
+/* +-8 g: fan vibration clips at +-2 g and the clipped signal shifts the angle */
+#define BMI160_ACC_RANGE_8G      0x08
+/* acc: odr 400 Hz, bwp = OSR4 (0x00) -> ~40 Hz low-pass, damps prop vibration */
+#define BMI160_ACC_CONF_400HZ_OSR4 0x0A
 #define BMI160_GYR_RANGE_2000DPS 0x00
 
-#define BMI160_ACC_LSB_PER_G    16384.0f
+#define BMI160_ACC_LSB_PER_G    4096.0f  /* +-8 g */
 #define BMI160_GYR_LSB_PER_DPS  16.4f
 
 #define BMI160_PMU_ACC_SHIFT 4
 #define BMI160_PMU_GYR_SHIFT 2
 #define BMI160_PMU_NORMAL    1
 
-#define BMI160_RAD2DEG (180.0f / 3.14159265f)
-#define BMI160_COMPLEMENTARY_ALPHA 0.98f
-
 struct bmi160_dev {
     spi_device_handle_t spi;
-    float pitch_deg;
-    float roll_deg;
-    int64_t last_us;
-    bool angle_ready;
 };
 
 static spi_device_handle_t s_spi;
@@ -62,12 +56,6 @@ static bool s_bus_ready;
 static int16_t bmi160_i16(const uint8_t *p)
 {
     return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
-static float bmi160_complementary(float angle, float gyro_rate, float dt, float angle_acc)
-{
-    const float alpha = BMI160_COMPLEMENTARY_ALPHA;
-    return alpha * (angle + gyro_rate * dt) + (1.0f - alpha) * angle_acc;
 }
 
 static void bmi160_delay_ms(int ms)
@@ -121,6 +109,8 @@ static esp_err_t bmi160_write_checked(bmi160_t *dev, uint8_t reg, uint8_t value)
     if (err != ESP_OK) {
         return err;
     }
+    /* Datasheet: >= 450 us between writes in suspend mode, 2 us in normal. */
+    esp_rom_delay_us(1000);
 
     uint8_t readback = 0;
     err = bmi160_read(dev, reg, &readback, 1);
@@ -191,17 +181,20 @@ static esp_err_t bmi160_configure(bmi160_t *dev)
     bmi160_delay_ms(100);
     ESP_RETURN_ON_ERROR(bmi160_check_id(dev, 1000), TAG, "id after reset");
 
-    ESP_RETURN_ON_ERROR(bmi160_write_checked(dev, BMI160_REG_ACC_CONF, BMI160_CONF_100HZ_NORMAL), TAG, "acc conf");
-    ESP_RETURN_ON_ERROR(bmi160_write_checked(dev, BMI160_REG_ACC_RANGE, BMI160_ACC_RANGE_2G), TAG, "acc range");
-    ESP_RETURN_ON_ERROR(bmi160_write_checked(dev, BMI160_REG_GYR_CONF, BMI160_CONF_100HZ_NORMAL), TAG, "gyr conf");
-    ESP_RETURN_ON_ERROR(bmi160_write_checked(dev, BMI160_REG_GYR_RANGE, BMI160_GYR_RANGE_2000DPS), TAG, "gyr range");
-
-    /* Accel suspend -> normal is ~4 ms; gyro is ~80 ms. */
+    /*
+     * Power up first: in suspend mode register writes need long gaps and
+     * may be ignored (0x28 readback is just the reset default).
+     * Accel suspend -> normal is ~4 ms; gyro is ~80 ms.
+     */
     ESP_RETURN_ON_ERROR(bmi160_command(dev, BMI160_CMD_ACC_NORMAL, BMI160_PMU_ACC_SHIFT, 50), TAG, "acc on");
     ESP_RETURN_ON_ERROR(bmi160_command(dev, BMI160_CMD_GYR_NORMAL, BMI160_PMU_GYR_SHIFT, 150), TAG, "gyr on");
 
-    dev->angle_ready = false;
-    ESP_LOGI(TAG, "ready, accel ±2 g, gyro ±2000 dps, 100 Hz");
+    ESP_RETURN_ON_ERROR(bmi160_write_checked(dev, BMI160_REG_ACC_CONF, BMI160_ACC_CONF_400HZ_OSR4), TAG, "acc conf");
+    ESP_RETURN_ON_ERROR(bmi160_write_checked(dev, BMI160_REG_ACC_RANGE, BMI160_ACC_RANGE_8G), TAG, "acc range");
+    ESP_RETURN_ON_ERROR(bmi160_write_checked(dev, BMI160_REG_GYR_CONF, BMI160_CONF_100HZ_NORMAL), TAG, "gyr conf");
+    ESP_RETURN_ON_ERROR(bmi160_write_checked(dev, BMI160_REG_GYR_RANGE, BMI160_GYR_RANGE_2000DPS), TAG, "gyr range");
+
+    ESP_LOGI(TAG, "ready, accel ±8 g OSR4, gyro ±2000 dps, 400 Hz");
     return ESP_OK;
 }
 
@@ -295,10 +288,8 @@ esp_err_t bmi160_read_sample(bmi160_t *dev, bmi160_sample_t *sample)
     ESP_RETURN_ON_FALSE(dev != NULL && sample != NULL, ESP_ERR_INVALID_ARG, TAG, "sample");
 
     uint8_t raw[12];
-    uint8_t temp[2];
 
     ESP_RETURN_ON_ERROR(bmi160_read(dev, BMI160_REG_DATA, raw, sizeof(raw)), TAG, "data");
-    ESP_RETURN_ON_ERROR(bmi160_read(dev, BMI160_REG_TEMP, temp, sizeof(temp)), TAG, "temp");
 
     sample->gyr_dps[0] = (float)bmi160_i16(&raw[0]) / BMI160_GYR_LSB_PER_DPS;
     sample->gyr_dps[1] = (float)bmi160_i16(&raw[2]) / BMI160_GYR_LSB_PER_DPS;
@@ -306,7 +297,6 @@ esp_err_t bmi160_read_sample(bmi160_t *dev, bmi160_sample_t *sample)
     sample->acc_g[0] = (float)bmi160_i16(&raw[6]) / BMI160_ACC_LSB_PER_G;
     sample->acc_g[1] = (float)bmi160_i16(&raw[8]) / BMI160_ACC_LSB_PER_G;
     sample->acc_g[2] = (float)bmi160_i16(&raw[10]) / BMI160_ACC_LSB_PER_G;
-    sample->temp_c = 23.0f + ((float)bmi160_i16(temp) / 512.0f);
 
     /* 180° about X: chip face flipped. Y and Z reverse, X stays. */
     sample->acc_g[1] = -sample->acc_g[1];
@@ -314,29 +304,5 @@ esp_err_t bmi160_read_sample(bmi160_t *dev, bmi160_sample_t *sample)
     sample->gyr_dps[1] = -sample->gyr_dps[1];
     sample->gyr_dps[2] = -sample->gyr_dps[2];
 
-    const float ax = sample->acc_g[0];
-    const float ay = sample->acc_g[1];
-    const float az = sample->acc_g[2];
-    /* 0 when that axis is horizontal, +90 when it points up. Flat board: both 0. */
-    const float pitch_acc = atan2f(ax, sqrtf(ay * ay + az * az)) * BMI160_RAD2DEG;
-    const float roll_acc = atan2f(ay, sqrtf(ax * ax + az * az)) * BMI160_RAD2DEG;
-
-    const int64_t now = esp_timer_get_time();
-    const float dt = dev->angle_ready ? (float)(now - dev->last_us) * 1.0e-6f : 0.0f;
-    dev->last_us = now;
-
-    if (!dev->angle_ready || dt <= 0.0f || dt > 0.05f) {
-        dev->pitch_deg = pitch_acc;
-        dev->roll_deg = roll_acc;
-        dev->angle_ready = true;
-    } else {
-        /* Pitch is rotation about Y, roll is rotation about X. */
-        dev->pitch_deg = bmi160_complementary(dev->pitch_deg, sample->gyr_dps[1], dt, pitch_acc);
-        dev->roll_deg = bmi160_complementary(dev->roll_deg, sample->gyr_dps[0], dt, roll_acc);
-    }
-
-    sample->pitch_deg = dev->pitch_deg;
-    sample->roll_deg = dev->roll_deg;
-    sample->tilt_deg = atan2f(sqrtf(ax * ax + ay * ay), fabsf(az)) * BMI160_RAD2DEG;
     return ESP_OK;
 }
