@@ -29,7 +29,7 @@ static const char *TAG = "pendulum";
  * D-складова береться прямо з гіроскопа (похідна за вимірюванням),
  * тому не потребує диференціювання кута і не стрибає при зміні цілі.
  */
-#define TARGET_ANGLE_DEG -1.0f /* кут, який треба утримувати                  */
+#define TARGET_ANGLE_DEG -2.0f /* кут, який треба утримувати                  */
 #define KP 10.0f               /* % на градус                                 */
 #define KI 0.0f                /* % на (градус * с), вмикати останнім         */
 #define KD 2.0f                /* % на (градус / с)                           */
@@ -46,7 +46,7 @@ static const char *TAG = "pendulum";
  */
 #define MIN_PWM_A 18.0f /* %                                           */
 #define MIN_PWM_B 18.0f /* %                                           */
-#define GAIN_A 1.0f
+#define GAIN_A 1.05f
 #define GAIN_B 1.2f
 /*
  * Напрямок обертання кожного мотора: 1 - як є, -1 - інвертувати
